@@ -98,12 +98,18 @@ Plugins/LicenseRuntime
 
 `ProjectDir/app.lic`
 
-> `CheckLicenseValid` 默认读取该路径。
+> `CheckLicenseValid` 默认读取该路径。  
+> 插件已在 `Build.cs` 内配置：打包时会自动将编辑器工程根目录下的 `app.lic` 作为 `NonUFS` 文件拷贝进打包产物。
 
 ### 4) 蓝图调用
 
 - 调用 `CheckLicenseValid()` 判断授权是否有效
 - 调用 `CreateLicense(User, Expire, Level, Permanent, SavePath)` 生成授权文件
+
+### 5) 打包后文件位置（默认）
+
+以 Windows 打包为例，`app.lic` 会随包输出到项目根目录（与打包后项目目录结构一致），
+运行时 `ProjectDir/app.lic` 可直接命中，无需额外手工拷贝。
 
 ---
 

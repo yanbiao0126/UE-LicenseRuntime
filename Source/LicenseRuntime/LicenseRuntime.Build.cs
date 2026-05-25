@@ -1,6 +1,7 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
 using UnrealBuildTool;
+using System.IO;
 
 public class LicenseRuntime : ModuleRules
 {
@@ -54,6 +55,25 @@ public class LicenseRuntime : ModuleRules
 		    Target.Platform == UnrealTargetPlatform.Linux)
 		{
 			AddEngineThirdPartyPrivateStaticDependencies(Target, "OpenSSL");
+		}
+
+		// 打包时自动将 ProjectDir/app.lic 放入打包结果（NonUFS，保持为独立文件）。
+		// 运行时 CheckLicenseValid() 仍按 ProjectDir/app.lic 读取即可。
+		if (Target.ProjectFile != null)
+		{
+			string LicensePath = Path.Combine(Target.ProjectFile.Directory.FullName, "app.lic");
+			if (File.Exists(LicensePath))
+			{
+				RuntimeDependencies.Add(LicensePath, StagedFileType.NonUFS);
+			}
+			else
+			{
+				System.Console.WriteLine("[LicenseRuntime] app.lic not found, skip staging: " + LicensePath);
+			}
+		}
+		else
+		{
+			System.Console.WriteLine("[LicenseRuntime] ProjectFile is null, skip app.lic staging.");
 		}
 	}
 }
