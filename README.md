@@ -34,9 +34,10 @@
 - 签名算法：`RSA + SHA256`
 - 数据加密：`AES-128-ECB`
 - OpenSSL 来源：UE 内置第三方库（`Build.cs` 中引入）
+- 纯离线防回拨：`可信时间状态文件 + 单调时钟漂移检测`
 
 License 文件结构（当前实现）：
-1. `EncryptedInfo`：固定结构体二进制数据（AES 加密后）
+1. `EncryptedInfo`：固定结构体二进制数据（AES 加密后，V2 内含 `ExpireUnixUtc`）
 2. `Signature`：256 字节 RSA 签名
 
 ---
@@ -134,6 +135,28 @@ Plugins/LicenseRuntime
 - 返回：当前实现固定返回 `true`
 - 失败信息：通过日志输出（例如私钥读取失败、签名失败）
 
+### 使用示例（对应 `ULicenseBPLibrary`）
+
+#### 示例 1：运行时校验（蓝图）
+
+在 `GameInstance` 的 `Event Init` 中：
+
+1. 调用 `CheckLicenseValid()`
+2. 分支判断返回值：
+   - `true`：进入正常流程（进入主菜单/关卡）
+   - `false`：提示“授权无效或已过期”，并退出或进入受限模式
+
+#### 示例 2：生成 License（蓝图）
+
+在内部工具蓝图（如 Editor Utility Widget）中调用：
+
+- `CreateLicense("TestUser", "2026-12-31", 2, false, "D:/Licenses/app.lic")`
+
+参数建议：
+- `Expire` 使用 `YYYY-MM-DD`
+- `Permanent = true` 时表示永久授权（仍建议保留标准日期字符串）
+- `SavePath` 使用绝对路径，避免写入到不可预期目录
+
 ---
 
 ## 校验流程
@@ -158,7 +181,8 @@ Plugins/LicenseRuntime
 
 - `private.key` 仅用于生成 License，不应下发到客户端
 - 当前 AES 密钥与公钥内嵌在代码中，生产环境建议进一步做密钥管理与混淆
-- 日期判断依赖字符串格式，建议统一 `YYYY-MM-DD`
+- 纯离线模式下，插件会在 `ProjectSavedDir/LicenseRuntime/license_state.dat` 保存可信时间状态；若该文件被篡改会导致校验失败
+- 日期输入建议统一 `YYYY-MM-DD`（生成时会转换为 UTC 时间戳用于过期判定）
 - 目前 `CreateLicense` 返回值不代表真实成功状态，建议后续改造为可靠返回
 
 ---
@@ -171,6 +195,7 @@ Plugins/LicenseRuntime
 - 检查 License 是否由匹配私钥签发
 - 检查系统时间是否正确
 - 检查日期格式是否为 `YYYY-MM-DD`
+- 若你升级到了当前版本（V2 载荷），请重新生成 License；旧格式文件会被拒绝
 
 ### 2) 无法生成 License
 
