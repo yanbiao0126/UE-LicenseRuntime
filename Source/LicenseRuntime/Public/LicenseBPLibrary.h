@@ -11,7 +11,7 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "License")
 	static bool CheckLicenseValid();
 	
-	UFUNCTION(BlueprintCallable, Category = "License")
+	UFUNCTION(BlueprintCallable, Category = "License", meta = (DevelopmentOnly))
 	static bool CreateLicense(const FString& User, const FString& Expire, int32 Level, bool Permanent, const FString& SavePath);
 	
 };

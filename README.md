@@ -91,7 +91,8 @@ Plugins/LicenseRuntime
 
 `ProjectDir/private.key`
 
-> `CreateLicense` 会从该路径读取私钥进行签名。
+> `CreateLicense` 会从该路径读取私钥进行签名。  
+> 出于安全考虑，`CreateLicense` 仅在编辑器环境可用（`WITH_EDITOR`）。
 
 ### 3) 放置客户端 License
 
@@ -132,7 +133,8 @@ Plugins/LicenseRuntime
   - `Level`：功能等级
   - `Permanent`：是否永久
   - `SavePath`：输出文件路径
-- 返回：当前实现固定返回 `true`
+- 限制：仅编辑器环境可调用；非编辑器环境会直接返回 `false`
+- 返回：`true` 表示生成成功，`false` 表示生成失败
 - 失败信息：通过日志输出（例如私钥读取失败、签名失败）
 
 ### 使用示例（对应 `ULicenseBPLibrary`）
@@ -148,7 +150,7 @@ Plugins/LicenseRuntime
 
 #### 示例 2：生成 License（蓝图）
 
-在内部工具蓝图（如 Editor Utility Widget）中调用：
+在内部工具蓝图（如 Editor Utility Widget）中调用（编辑器环境）：
 
 - `CreateLicense("TestUser", "2026-12-31", 2, false, "D:/Licenses/app.lic")`
 
@@ -164,8 +166,9 @@ Plugins/LicenseRuntime
 1. 读取 `.lic` 文件中的加密授权信息与签名
 2. 使用内置公钥执行 `RSA_verify(SHA256(data), signature)`
 3. 验签通过后进行 AES 解密
-4. 若非永久授权，则与当前日期比较是否过期
-5. 结果返回给业务逻辑处理
+4. 执行离线防回拨检测（多副本可信时间状态 + 单调时钟漂移检测）
+5. 若非永久授权，则使用 UTC 时间戳判定是否过期
+6. 结果返回给业务逻辑处理
 
 ---
 
@@ -181,9 +184,8 @@ Plugins/LicenseRuntime
 
 - `private.key` 仅用于生成 License，不应下发到客户端
 - 当前 AES 密钥与公钥内嵌在代码中，生产环境建议进一步做密钥管理与混淆
-- 纯离线模式下，插件会在 `ProjectSavedDir/LicenseRuntime/license_state.dat` 保存可信时间状态；若该文件被篡改会导致校验失败
+- 纯离线模式下，插件会在多个路径保存可信时间状态副本（`ProjectSavedDir`、`ProjectPersistentDownloadDir`、`UserSettingsDir`）；任一副本缺失/损坏都会计入异常次数
 - 日期输入建议统一 `YYYY-MM-DD`（生成时会转换为 UTC 时间戳用于过期判定）
-- 目前 `CreateLicense` 返回值不代表真实成功状态，建议后续改造为可靠返回
 
 ---
 

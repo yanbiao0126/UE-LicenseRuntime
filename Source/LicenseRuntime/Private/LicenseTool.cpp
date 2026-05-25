@@ -1,7 +1,9 @@
 ﻿#include "LicenseTool.h"
 #include "Misc/Paths.h"
 #include "Misc/FileHelper.h"
+#include "Misc/App.h"
 #include "HAL/PlatformFileManager.h"
+#include "HAL/PlatformProcess.h"
 #include "CoreMinimal.h"
 #include "Containers/StringConv.h"
 
@@ -77,6 +79,7 @@ constexpr uint32 LICENSE_PAYLOAD_MAGIC = 0x3243494C; // "LIC2"
 constexpr uint32 LICENSE_PAYLOAD_VERSION = 2;
 constexpr uint32 LICENSE_STATE_MAGIC = 0x54534C52; // "RLST"
 constexpr uint32 LICENSE_STATE_VERSION = 1;
+constexpr const TCHAR* STATE_FILE_RELATIVE_PATH = TEXT("LicenseRuntime/license_state.dat");
 
 // 允许系统时间回拨的容差（秒）。
 // 建议 120~600，过小容易误伤（时钟同步抖动），过大则降低防护强度。
@@ -116,9 +119,29 @@ static bool RSA_Verify(const uint8* Data, int Len, const uint8 Sig[256])
     return ret == 1;
 }
 
-static FString GetStateFilePath()
+static void AddUniqueStatePath(TArray<FString>& Paths, const FString& Path)
 {
-    return FPaths::ProjectSavedDir() / TEXT("LicenseRuntime/license_state.dat");
+    if (Path.IsEmpty())
+    {
+        return;
+    }
+
+    const FString StandardPath = FPaths::ConvertRelativePathToFull(Path);
+    if (!Paths.Contains(StandardPath))
+    {
+        Paths.Add(StandardPath);
+    }
+}
+
+static TArray<FString> GetStateFilePaths()
+{
+    TArray<FString> Paths;
+
+    AddUniqueStatePath(Paths, FPaths::ProjectSavedDir() / STATE_FILE_RELATIVE_PATH);
+    AddUniqueStatePath(Paths, FPaths::ProjectPersistentDownloadDir() / STATE_FILE_RELATIVE_PATH);
+    AddUniqueStatePath(Paths, FString(FPlatformProcess::UserSettingsDir()) / FApp::GetProjectName() / STATE_FILE_RELATIVE_PATH);
+
+    return Paths;
 }
 
 static int64 GetNowUtcSeconds()
@@ -162,9 +185,8 @@ static void BuildStateDigest(const FLicenseStateCore& Core, uint8 OutDigest[32])
     SHA256(Buffer, sizeof(Buffer), OutDigest);
 }
 
-static bool SaveState(const FLicenseStateCore& Core)
+static bool SaveStateToPath(const FLicenseStateCore& Core, const FString& StatePath)
 {
-    const FString StatePath = GetStateFilePath();
     IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
     PlatformFile.CreateDirectoryTree(*FPaths::GetPath(StatePath));
 
@@ -184,9 +206,8 @@ static bool SaveState(const FLicenseStateCore& Core)
     return bOk;
 }
 
-static bool LoadState(FLicenseStateCore& OutCore)
+static bool LoadStateFromPath(const FString& StatePath, FLicenseStateCore& OutCore)
 {
-    const FString StatePath = GetStateFilePath();
     IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
     if (!PlatformFile.FileExists(*StatePath))
     {
@@ -234,22 +255,51 @@ static bool LoadState(FLicenseStateCore& OutCore)
     return true;
 }
 
+static bool SaveStateToAllPaths(const FLicenseStateCore& Core)
+{
+    const TArray<FString> StatePaths = GetStateFilePaths();
+    bool bAllSaved = true;
+    for (const FString& StatePath : StatePaths)
+    {
+        if (!SaveStateToPath(Core, StatePath))
+        {
+            bAllSaved = false;
+        }
+    }
+    return bAllSaved;
+}
+
 static bool VerifyOfflineTimeAndUpdateState()
 {
     const int64 NowUtc = GetNowUtcSeconds();
     const double NowMono = FPlatformTime::Seconds();
     IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
-    const FString StatePath = GetStateFilePath();
-    const bool bStateFileExists = PlatformFile.FileExists(*StatePath);
+    const TArray<FString> StatePaths = GetStateFilePaths();
 
-    FLicenseStateCore Previous{};
-    const bool bHasState = LoadState(Previous);
-    if (bStateFileExists && !bHasState)
+    TArray<FLicenseStateCore> ValidStates;
+    int32 ExistingFileCount = 0;
+    int32 InvalidFileCount = 0;
+
+    for (const FString& StatePath : StatePaths)
     {
-        UE_LOG(LogTemp, Error, TEXT("LicenseRuntime: 状态文件存在但校验失败，拒绝授权。"));
-        return false;
+        if (!PlatformFile.FileExists(*StatePath))
+        {
+            continue;
+        }
+
+        ++ExistingFileCount;
+        FLicenseStateCore State{};
+        if (LoadStateFromPath(StatePath, State))
+        {
+            ValidStates.Add(State);
+        }
+        else
+        {
+            ++InvalidFileCount;
+        }
     }
-    if (!bHasState)
+
+    if (ExistingFileCount == 0)
     {
         FLicenseStateCore Initial{};
         Initial.Magic = LICENSE_STATE_MAGIC;
@@ -258,7 +308,23 @@ static bool VerifyOfflineTimeAndUpdateState()
         Initial.LastMonotonicSeconds = NowMono;
         Initial.AnomalyCount = 0;
         Initial.Salt = static_cast<uint64>(FPlatformTime::Cycles64()) ^ static_cast<uint64>(NowUtc);
-        return SaveState(Initial);
+        return SaveStateToAllPaths(Initial);
+    }
+
+    if (ValidStates.Num() == 0)
+    {
+        UE_LOG(LogTemp, Error, TEXT("LicenseRuntime: 所有状态副本均不可用，疑似篡改，拒绝授权。"));
+        return false;
+    }
+
+    FLicenseStateCore Previous = ValidStates[0];
+    for (int32 Index = 1; Index < ValidStates.Num(); ++Index)
+    {
+        const FLicenseStateCore& Candidate = ValidStates[Index];
+        if (Candidate.LastTrustedUtc > Previous.LastTrustedUtc)
+        {
+            Previous = Candidate;
+        }
     }
 
     const int64 DeltaUtc = NowUtc - Previous.LastTrustedUtc;
@@ -268,7 +334,9 @@ static bool VerifyOfflineTimeAndUpdateState()
 
     const bool bRollback = DeltaUtc < -ALLOW_BACK_SECONDS;
     const bool bDriftAnomaly = Drift > DRIFT_TOLERANCE_SECONDS;
-    const bool bAnomaly = bRollback || bDriftAnomaly;
+    const bool bMissingReplica = ExistingFileCount < StatePaths.Num();
+    const bool bCorruptReplica = InvalidFileCount > 0;
+    const bool bAnomaly = bRollback || bDriftAnomaly || bMissingReplica || bCorruptReplica;
 
     FLicenseStateCore Next = Previous;
     Next.LastMonotonicSeconds = NowMono;
@@ -280,22 +348,24 @@ static bool VerifyOfflineTimeAndUpdateState()
     if (bAnomaly)
     {
         Next.AnomalyCount = Previous.AnomalyCount + 1;
-        SaveState(Next);
+        SaveStateToAllPaths(Next);
 
         UE_LOG(
             LogTemp,
             Warning,
-            TEXT("LicenseRuntime: 检测到系统时间异常，DeltaUtc=%lld, DeltaMono=%lld, Drift=%lld, Count=%u"),
+            TEXT("LicenseRuntime: 检测到授权状态异常，DeltaUtc=%lld, DeltaMono=%lld, Drift=%lld, MissingReplica=%d, CorruptReplica=%d, Count=%u"),
             DeltaUtc,
             DeltaMono,
             Drift,
+            bMissingReplica ? 1 : 0,
+            bCorruptReplica ? 1 : 0,
             Next.AnomalyCount
         );
         return Next.AnomalyCount < MAX_ANOMALY_COUNT;
     }
 
     Next.AnomalyCount = 0;
-    return SaveState(Next);
+    return SaveStateToAllPaths(Next);
 }
 
 static bool LoadPrivateKeyPem(FString& OutPrivateKeyPem)
@@ -424,15 +494,19 @@ bool FLicenseTool::VerifyLicense(const FString& LicPath, FLicenseInfo& OutInfo)
 // ==============================================
 // 创建 License
 // ==============================================
-void FLicenseTool::CreateLicense(const FString& User, const FString& Expire, int32 Level, bool Permanent, const FString& SavePath)
+bool FLicenseTool::CreateLicense(const FString& User, const FString& Expire, int32 Level, bool Permanent, const FString& SavePath)
 {
+#if !WITH_EDITOR
+    UE_LOG(LogTemp, Error, TEXT("LicenseRuntime: CreateLicense 仅支持编辑器环境。"));
+    return false;
+#else
     IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
 
     int64 ExpireUnixUtc = 0;
     if (!Permanent && !ParseExpireDateToUtc(Expire, ExpireUnixUtc))
     {
         UE_LOG(LogTemp, Error, TEXT("LicenseRuntime: Expire 参数格式错误，要求 YYYY-MM-DD: %s"), *Expire);
-        return;
+        return false;
     }
 
     FLicensePayloadV2 Payload{};
@@ -451,18 +525,24 @@ void FLicenseTool::CreateLicense(const FString& User, const FString& Expire, int
     if (!RSA_Sign(reinterpret_cast<const uint8*>(&EncryptedPayload), sizeof(EncryptedPayload), Sig))
     {
         UE_LOG(LogTemp, Error, TEXT("LicenseRuntime: License 签名失败，未写入文件: %s"), *SavePath);
-        return;
+        return false;
     }
 
     IFileHandle* Handle = PlatformFile.OpenWrite(*SavePath);
     if (Handle)
     {
-        Handle->Write(reinterpret_cast<const uint8*>(&EncryptedPayload), sizeof(EncryptedPayload));
-        Handle->Write(Sig, 256);
+        const bool bWritePayloadOk = Handle->Write(reinterpret_cast<const uint8*>(&EncryptedPayload), sizeof(EncryptedPayload));
+        const bool bWriteSigOk = Handle->Write(Sig, 256);
         delete Handle;
+        if (!bWritePayloadOk || !bWriteSigOk)
+        {
+            UE_LOG(LogTemp, Error, TEXT("LicenseRuntime: License 文件写入不完整: %s"), *SavePath);
+            return false;
+        }
+        return true;
     }
-    else
-    {
-        UE_LOG(LogTemp, Error, TEXT("LicenseRuntime: 无法写入 License 文件: %s"), *SavePath);
-    }
+    
+    UE_LOG(LogTemp, Error, TEXT("LicenseRuntime: 无法写入 License 文件: %s"), *SavePath);
+    return false;
+#endif
 }

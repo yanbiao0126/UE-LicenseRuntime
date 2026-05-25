@@ -15,5 +15,5 @@ class LICENSERUNTIME_API FLicenseTool
 {
 public:
 	static bool VerifyLicense(const FString& LicPath, FLicenseInfo& OutInfo);
-	static void CreateLicense(const FString& User, const FString& Expire, int32 Level, bool Permanent, const FString& SavePath);
+	static bool CreateLicense(const FString& User, const FString& Expire, int32 Level, bool Permanent, const FString& SavePath);
 };

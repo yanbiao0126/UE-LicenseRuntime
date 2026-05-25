@@ -12,6 +12,5 @@ bool ULicenseBPLibrary::CheckLicenseValid()
 bool ULicenseBPLibrary::CreateLicense(const FString& User, const FString& Expire, int32 Level, bool Permanent,
 	const FString& SavePath)
 {
-	FLicenseTool::CreateLicense(User, Expire, Level, Permanent, SavePath);
-	return true;
+	return FLicenseTool::CreateLicense(User, Expire, Level, Permanent, SavePath);
 }
