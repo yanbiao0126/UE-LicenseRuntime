@@ -26,6 +26,7 @@
   - `ExpireDate`：过期日期（`YYYY-MM-DD`）
   - `FuncLevel`：功能等级
   - `bPermanent`：是否永久授权
+  - `ProjectId`：项目绑定ID（GUID，防跨项目复用）
 
 ---
 
@@ -37,7 +38,7 @@
 - 纯离线防回拨：`可信时间状态文件 + 单调时钟漂移检测`
 
 License 文件结构（当前实现）：
-1. `EncryptedInfo`：固定结构体二进制数据（AES 加密后，V2 内含 `ExpireUnixUtc`）
+1. `EncryptedInfo`：固定结构体二进制数据（AES 加密后，V3 内含 `ExpireUnixUtc` + `ProjectId`）
 2. `Signature`：256 字节 RSA 签名
 
 ---
@@ -94,7 +95,21 @@ Plugins/LicenseRuntime
 > `CreateLicense` 会从该路径读取私钥进行签名。  
 > 出于安全考虑，`CreateLicense` 仅在编辑器环境可用（`WITH_EDITOR`）。
 
-### 3) 放置客户端 License
+### 3) 配置项目绑定ID（必须）
+
+在项目 `Config/DefaultGame.ini` 中添加：
+
+```ini
+[/Script/LicenseRuntime.LicenseRuntimeSettings]
+ProjectId="{01234567-89AB-CDEF-0123-456789ABCDEF}"
+```
+
+说明：
+- `ProjectId` 必须是合法 GUID（推荐带中划线格式）
+- 生成与校验都会读取该配置；缺失或非法会直接失败
+- 同一 License 仅能在 `ProjectId` 一致的项目内使用
+
+### 4) 放置客户端 License
 
 将授权文件放在：
 
@@ -103,12 +118,12 @@ Plugins/LicenseRuntime
 > `CheckLicenseValid` 默认读取该路径。  
 > 插件已在 `Build.cs` 内配置：打包时会自动将编辑器工程根目录下的 `app.lic` 作为 `NonUFS` 文件拷贝进打包产物。
 
-### 4) 蓝图调用
+### 5) 蓝图调用
 
 - 调用 `CheckLicenseValid()` 判断授权是否有效
 - 调用 `CreateLicense(User, Expire, Level, Permanent, SavePath)` 生成授权文件
 
-### 5) 打包后文件位置（默认）
+### 6) 打包后文件位置（默认）
 
 以 Windows 打包为例，`app.lic` 会随包输出到项目根目录（与打包后项目目录结构一致），
 运行时 `ProjectDir/app.lic` 可直接命中，无需额外手工拷贝。
@@ -122,8 +137,8 @@ Plugins/LicenseRuntime
 - 输入：无
 - 默认读取：`ProjectDir/app.lic`
 - 返回：
-  - `true`：验签通过，且未过期或永久授权
-  - `false`：文件不存在、验签失败、解密失败、授权过期等
+  - `true`：验签通过、项目ID匹配、且未过期或永久授权
+  - `false`：文件不存在、验签失败、解密失败、项目ID不匹配、授权过期等
 
 ### `CreateLicense(User, Expire, Level, Permanent, SavePath) -> bool`
 
@@ -166,9 +181,10 @@ Plugins/LicenseRuntime
 1. 读取 `.lic` 文件中的加密授权信息与签名
 2. 使用内置公钥执行 `RSA_verify(SHA256(data), signature)`
 3. 验签通过后进行 AES 解密
-4. 执行离线防回拨检测（多副本可信时间状态 + 单调时钟漂移检测）
-5. 若非永久授权，则使用 UTC 时间戳判定是否过期
-6. 结果返回给业务逻辑处理
+4. 校验 `License.ProjectId` 与当前项目配置 `ProjectId` 是否一致
+5. 执行离线防回拨检测（多副本可信时间状态 + 单调时钟漂移检测）
+6. 若非永久授权，则使用 UTC 时间戳判定是否过期
+7. 结果返回给业务逻辑处理
 
 ---
 
@@ -186,6 +202,7 @@ Plugins/LicenseRuntime
 - 当前 AES 密钥与公钥内嵌在代码中，生产环境建议进一步做密钥管理与混淆
 - 纯离线模式下，插件会在多个路径保存可信时间状态副本（`ProjectSavedDir`、`ProjectPersistentDownloadDir`、`UserSettingsDir`）；任一副本缺失/损坏都会计入异常次数
 - 日期输入建议统一 `YYYY-MM-DD`（生成时会转换为 UTC 时间戳用于过期判定）
+- 项目绑定ID（`ProjectId`）必须在 `DefaultGame.ini` 配置且格式合法（GUID）
 
 ---
 
@@ -197,12 +214,38 @@ Plugins/LicenseRuntime
 - 检查 License 是否由匹配私钥签发
 - 检查系统时间是否正确
 - 检查日期格式是否为 `YYYY-MM-DD`
-- 若你升级到了当前版本（V2 载荷），请重新生成 License；旧格式文件会被拒绝
+- 当前版本已升级为 V3（含 `ProjectId` 绑定），旧 V2 License 会被强制拒绝，请重新签发
 
 ### 2) 无法生成 License
 
 - 检查 `ProjectDir/private.key` 是否存在且 PEM 内容合法
 - 查看日志中 `LicenseRuntime` 关键字报错
+
+---
+
+## 项目ID绑定验证清单
+
+可按以下场景逐项执行回归：
+
+1) 正向验证（同项目）  
+- 前置：`DefaultGame.ini` 已配置合法 `ProjectId`，并在该项目内调用 `CreateLicense` 生成 `app.lic`  
+- 执行：运行 `CheckLicenseValid()`  
+- 预期：返回 `true`
+
+2) 跨项目复用拦截  
+- 前置：将上一步生成的 `app.lic` 复制到另一个 `ProjectId` 不同的项目  
+- 执行：运行 `CheckLicenseValid()`  
+- 预期：返回 `false`，日志包含“项目ID不匹配，拒绝复用授权”
+
+3) 配置缺失/非法拦截  
+- 前置：删除或写错 `ProjectId`（非GUID）  
+- 执行：分别调用 `CreateLicense` 与 `CheckLicenseValid()`  
+- 预期：均返回 `false`，日志提示“缺少项目ID配置”或“项目ID格式非法”
+
+4) 旧版授权淘汰  
+- 前置：准备历史 V2 格式 `app.lic`  
+- 执行：运行 `CheckLicenseValid()`  
+- 预期：返回 `false`，日志提示“旧版V2授权文件，已强制失效”
 
 ---
 

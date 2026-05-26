@@ -6,6 +6,8 @@
 #include "HAL/PlatformProcess.h"
 #include "CoreMinimal.h"
 #include "Containers/StringConv.h"
+#include "Misc/ConfigCacheIni.h"
+#include "Misc/Guid.h"
 
 THIRD_PARTY_INCLUDES_START
 // UE 在 ObjectMacros 中定义了 namespace UI，和 OpenSSL 的 UI 类型重名。
@@ -18,7 +20,7 @@ THIRD_PARTY_INCLUDES_START
 #undef UI
 THIRD_PARTY_INCLUDES_END
 
-struct FLicensePayloadV2
+struct FLicensePayloadV2Legacy
 {
     uint32 Magic;
     uint32 Version;
@@ -29,6 +31,20 @@ struct FLicensePayloadV2
     uint8 ReservedA[7];
     int64 ExpireUnixUtc;
     uint8 ReservedB[16];
+};
+
+struct FLicensePayloadV3
+{
+    uint32 Magic;
+    uint32 Version;
+    ANSICHAR Username[64];
+    ANSICHAR ExpireDate[20];
+    int32 FuncLevel;
+    uint8 bPermanent;
+    uint8 ReservedA[7];
+    int64 ExpireUnixUtc;
+    ANSICHAR ProjectId[40];
+    uint8 ReservedB[8];
 };
 
 struct FLicenseStateCore
@@ -48,7 +64,8 @@ struct FLicenseStateFile
     uint8 Digest[32];
 };
 
-static_assert(sizeof(FLicensePayloadV2) % 16 == 0, "License payload must be 16-byte aligned for AES ECB blocks.");
+static_assert(sizeof(FLicensePayloadV2Legacy) == 128, "Unexpected legacy payload size.");
+static_assert(sizeof(FLicensePayloadV3) % 16 == 0, "License payload must be 16-byte aligned for AES ECB blocks.");
 
 // ==============================================
 // 密钥配置
@@ -77,10 +94,14 @@ const uint8 STATE_SECRET[32] = {
 };
 
 constexpr uint32 LICENSE_PAYLOAD_MAGIC = 0x3243494C; // "LIC2"
-constexpr uint32 LICENSE_PAYLOAD_VERSION = 2;
+constexpr uint32 LICENSE_PAYLOAD_VERSION = 3;
 constexpr uint32 LICENSE_STATE_MAGIC = 0x54534C52; // "RLST"
 constexpr uint32 LICENSE_STATE_VERSION = 2;
 constexpr const TCHAR* STATE_FILE_RELATIVE_PATH = TEXT("LicenseRuntime/license_state.dat");
+constexpr const TCHAR* PROJECT_ID_SECTION = TEXT("/Script/LicenseRuntime.LicenseRuntimeSettings");
+constexpr const TCHAR* PROJECT_ID_KEY = TEXT("ProjectId");
+constexpr const TCHAR* PROJECT_SETTINGS_SECTION = TEXT("/Script/EngineSettings.GeneralProjectSettings");
+constexpr const TCHAR* PROJECT_SETTINGS_ID_KEY = TEXT("ProjectID");
 
 // 允许系统时间回拨的容差（秒）。
 // 建议 120~600，过小容易误伤（时钟同步抖动），过大则降低防护强度。
@@ -150,6 +171,72 @@ static int64 GetNowUtcSeconds()
     return FDateTime::UtcNow().ToUnixTimestamp();
 }
 
+static bool NormalizeProjectId(const FString& InProjectId, FString& OutNormalizedProjectId)
+{
+    const FString TrimmedProjectId = InProjectId.TrimStartAndEnd();
+    if (TrimmedProjectId.IsEmpty())
+    {
+        return false;
+    }
+
+    FGuid ParsedGuid;
+    const bool bParsed =
+        FGuid::Parse(TrimmedProjectId, ParsedGuid) ||
+        FGuid::ParseExact(TrimmedProjectId, EGuidFormats::DigitsWithHyphens, ParsedGuid) ||
+        FGuid::ParseExact(TrimmedProjectId, EGuidFormats::DigitsWithHyphensInBraces, ParsedGuid) ||
+        FGuid::ParseExact(TrimmedProjectId, EGuidFormats::DigitsWithHyphensInParentheses, ParsedGuid) ||
+        FGuid::ParseExact(TrimmedProjectId, EGuidFormats::Digits, ParsedGuid);
+    if (!bParsed)
+    {
+        return false;
+    }
+
+    OutNormalizedProjectId = ParsedGuid.ToString(EGuidFormats::DigitsWithHyphens).ToUpper();
+    return true;
+}
+
+static bool GetConfiguredProjectId(FString& OutProjectId)
+{
+    if (!GConfig)
+    {
+        UE_LOG(LogTemp, Error, TEXT("LicenseRuntime: 配置系统未就绪，无法读取项目ID。"));
+        return false;
+    }
+
+    FString RawProjectId;
+    if (GConfig->GetString(PROJECT_ID_SECTION, PROJECT_ID_KEY, RawProjectId, GGameIni))
+    {
+        if (NormalizeProjectId(RawProjectId, OutProjectId))
+        {
+            return true;
+        }
+
+        UE_LOG(LogTemp, Error, TEXT("LicenseRuntime: 项目ID格式非法（需GUID），当前值: %s"), *RawProjectId);
+        return false;
+    }
+
+    if (GConfig->GetString(PROJECT_SETTINGS_SECTION, PROJECT_SETTINGS_ID_KEY, RawProjectId, GGameIni))
+    {
+        if (NormalizeProjectId(RawProjectId, OutProjectId))
+        {
+            UE_LOG(LogTemp, Log, TEXT("LicenseRuntime: 使用 GeneralProjectSettings.ProjectID 作为授权项目ID。"));
+            return true;
+        }
+
+        UE_LOG(LogTemp, Error, TEXT("LicenseRuntime: GeneralProjectSettings.ProjectID 格式非法（需GUID），当前值: %s"), *RawProjectId);
+        return false;
+    }
+
+    UE_LOG(
+        LogTemp,
+        Error,
+        TEXT("LicenseRuntime: 缺少项目ID配置。请配置 [%s] %s，或设置 [%s] %s。"),
+        PROJECT_ID_SECTION,
+        PROJECT_ID_KEY,
+        PROJECT_SETTINGS_SECTION,
+        PROJECT_SETTINGS_ID_KEY);
+    return false;
+}
 static bool ParseExpireDateToUtc(const FString& ExpireDate, int64& OutUnixUtc)
 {
     TArray<FString> Parts;
@@ -453,14 +540,19 @@ static void AES_EncryptFixed(const uint8* In, uint8* Out, int Len)
         AES_ecb_encrypt(In + i, Out + i, &aesKey, AES_ENCRYPT);
 }
 
-static bool VerifyLicensePayloadV2(const uint8* EncryptedPayload, const uint8 Sig[256], const uint8 CurrentLicenseHash[32], FLicenseInfo& OutInfo)
+static bool VerifyLicensePayloadV3(
+    const uint8* EncryptedPayload,
+    const uint8 Sig[256],
+    const uint8 CurrentLicenseHash[32],
+    const FString& ConfiguredProjectId,
+    FLicenseInfo& OutInfo)
 {
-    if (!RSA_Verify(EncryptedPayload, sizeof(FLicensePayloadV2), Sig))
+    if (!RSA_Verify(EncryptedPayload, sizeof(FLicensePayloadV3), Sig))
     {
         return false;
     }
 
-    FLicensePayloadV2 Payload{};
+    FLicensePayloadV3 Payload{};
     AES_DecryptFixed(EncryptedPayload, reinterpret_cast<uint8*>(&Payload), sizeof(Payload));
 
     if (Payload.Magic != LICENSE_PAYLOAD_MAGIC || Payload.Version != LICENSE_PAYLOAD_VERSION)
@@ -470,6 +562,24 @@ static bool VerifyLicensePayloadV2(const uint8* EncryptedPayload, const uint8 Si
 
     if (!VerifyOfflineTimeAndUpdateState(CurrentLicenseHash))
     {
+        return false;
+    }
+
+    FString NormalizedPayloadProjectId;
+    if (!NormalizeProjectId(UTF8_TO_TCHAR(Payload.ProjectId), NormalizedPayloadProjectId))
+    {
+        UE_LOG(LogTemp, Error, TEXT("LicenseRuntime: License 中的项目ID格式非法。"));
+        return false;
+    }
+
+    if (!NormalizedPayloadProjectId.Equals(ConfiguredProjectId, ESearchCase::CaseSensitive))
+    {
+        UE_LOG(
+            LogTemp,
+            Error,
+            TEXT("LicenseRuntime: 项目ID不匹配，拒绝复用授权。License=%s, Project=%s"),
+            *NormalizedPayloadProjectId,
+            *ConfiguredProjectId);
         return false;
     }
 
@@ -492,6 +602,12 @@ static bool VerifyLicensePayloadV2(const uint8* EncryptedPayload, const uint8 Si
 // ==============================================
 bool FLicenseTool::VerifyLicense(const FString& LicPath, FLicenseInfo& OutInfo)
 {
+    FString ConfiguredProjectId;
+    if (!GetConfiguredProjectId(ConfiguredProjectId))
+    {
+        return false;
+    }
+
     IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
     IFileHandle* Handle = PlatformFile.OpenRead(*LicPath);
     if (!Handle)
@@ -502,9 +618,9 @@ bool FLicenseTool::VerifyLicense(const FString& LicPath, FLicenseInfo& OutInfo)
     const int64 FileSize = Handle->Size();
     uint8 Sig[256];
 
-    if (FileSize == static_cast<int64>(sizeof(FLicensePayloadV2) + sizeof(Sig)))
+    if (FileSize == static_cast<int64>(sizeof(FLicensePayloadV3) + sizeof(Sig)))
     {
-        uint8 EncryptedPayload[sizeof(FLicensePayloadV2)];
+        uint8 EncryptedPayload[sizeof(FLicensePayloadV3)];
         const bool bReadPayload = Handle->Read(EncryptedPayload, sizeof(EncryptedPayload));
         const bool bReadSig = Handle->Read(Sig, sizeof(Sig));
         delete Handle;
@@ -513,11 +629,18 @@ bool FLicenseTool::VerifyLicense(const FString& LicPath, FLicenseInfo& OutInfo)
             return false;
         }
         uint8 CurrentLicenseHash[32];
-        uint8 RawLicenseBytes[sizeof(FLicensePayloadV2) + sizeof(Sig)];
+        uint8 RawLicenseBytes[sizeof(FLicensePayloadV3) + sizeof(Sig)];
         FMemory::Memcpy(RawLicenseBytes, EncryptedPayload, sizeof(EncryptedPayload));
         FMemory::Memcpy(RawLicenseBytes + sizeof(EncryptedPayload), Sig, sizeof(Sig));
         SHA256(RawLicenseBytes, sizeof(RawLicenseBytes), CurrentLicenseHash);
-        return VerifyLicensePayloadV2(EncryptedPayload, Sig, CurrentLicenseHash, OutInfo);
+        return VerifyLicensePayloadV3(EncryptedPayload, Sig, CurrentLicenseHash, ConfiguredProjectId, OutInfo);
+    }
+
+    if (FileSize == static_cast<int64>(sizeof(FLicensePayloadV2Legacy) + sizeof(Sig)))
+    {
+        delete Handle;
+        UE_LOG(LogTemp, Error, TEXT("LicenseRuntime: 检测到旧版V2授权文件，已强制失效，请重新签发V3 License: %s"), *LicPath);
+        return false;
     }
 
     delete Handle;
@@ -535,6 +658,11 @@ bool FLicenseTool::CreateLicense(const FString& User, const FString& Expire, int
     return false;
 #else
     IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+    FString ConfiguredProjectId;
+    if (!GetConfiguredProjectId(ConfiguredProjectId))
+    {
+        return false;
+    }
 
     int64 ExpireUnixUtc = 0;
     if (!Permanent && !ParseExpireDateToUtc(Expire, ExpireUnixUtc))
@@ -543,16 +671,17 @@ bool FLicenseTool::CreateLicense(const FString& User, const FString& Expire, int
         return false;
     }
 
-    FLicensePayloadV2 Payload{};
+    FLicensePayloadV3 Payload{};
     Payload.Magic = LICENSE_PAYLOAD_MAGIC;
     Payload.Version = LICENSE_PAYLOAD_VERSION;
     FCStringAnsi::Strncpy(Payload.Username, TCHAR_TO_UTF8(*User), UE_ARRAY_COUNT(Payload.Username));
     FCStringAnsi::Strncpy(Payload.ExpireDate, TCHAR_TO_UTF8(*Expire), UE_ARRAY_COUNT(Payload.ExpireDate));
+    FCStringAnsi::Strncpy(Payload.ProjectId, TCHAR_TO_UTF8(*ConfiguredProjectId), UE_ARRAY_COUNT(Payload.ProjectId));
     Payload.FuncLevel = Level;
     Payload.bPermanent = Permanent ? 1 : 0;
     Payload.ExpireUnixUtc = Permanent ? TNumericLimits<int64>::Max() : ExpireUnixUtc;
 
-    FLicensePayloadV2 EncryptedPayload{};
+    FLicensePayloadV3 EncryptedPayload{};
     AES_EncryptFixed(reinterpret_cast<const uint8*>(&Payload), reinterpret_cast<uint8*>(&EncryptedPayload), sizeof(EncryptedPayload));
 
     uint8 Sig[256];
