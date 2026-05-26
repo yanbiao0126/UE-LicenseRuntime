@@ -38,6 +38,7 @@ struct FLicenseStateCore
     int64 LastTrustedUtc;
     double LastMonotonicSeconds;
     uint32 AnomalyCount;
+    uint8 LicenseHash[32];
     uint64 Salt;
 };
 
@@ -78,7 +79,7 @@ const uint8 STATE_SECRET[32] = {
 constexpr uint32 LICENSE_PAYLOAD_MAGIC = 0x3243494C; // "LIC2"
 constexpr uint32 LICENSE_PAYLOAD_VERSION = 2;
 constexpr uint32 LICENSE_STATE_MAGIC = 0x54534C52; // "RLST"
-constexpr uint32 LICENSE_STATE_VERSION = 1;
+constexpr uint32 LICENSE_STATE_VERSION = 2;
 constexpr const TCHAR* STATE_FILE_RELATIVE_PATH = TEXT("LicenseRuntime/license_state.dat");
 
 // 允许系统时间回拨的容差（秒）。
@@ -269,7 +270,19 @@ static bool SaveStateToAllPaths(const FLicenseStateCore& Core)
     return bAllSaved;
 }
 
-static bool VerifyOfflineTimeAndUpdateState()
+static void InitializeStateCore(FLicenseStateCore& OutCore, int64 NowUtc, double NowMono, const uint8 CurrentLicenseHash[32])
+{
+    OutCore = {};
+    OutCore.Magic = LICENSE_STATE_MAGIC;
+    OutCore.Version = LICENSE_STATE_VERSION;
+    OutCore.LastTrustedUtc = NowUtc;
+    OutCore.LastMonotonicSeconds = NowMono;
+    OutCore.AnomalyCount = 0;
+    FMemory::Memcpy(OutCore.LicenseHash, CurrentLicenseHash, 32);
+    OutCore.Salt = static_cast<uint64>(FPlatformTime::Cycles64()) ^ static_cast<uint64>(NowUtc);
+}
+
+static bool VerifyOfflineTimeAndUpdateState(const uint8 CurrentLicenseHash[32])
 {
     const int64 NowUtc = GetNowUtcSeconds();
     const double NowMono = FPlatformTime::Seconds();
@@ -302,19 +315,34 @@ static bool VerifyOfflineTimeAndUpdateState()
     if (ExistingFileCount == 0)
     {
         FLicenseStateCore Initial{};
-        Initial.Magic = LICENSE_STATE_MAGIC;
-        Initial.Version = LICENSE_STATE_VERSION;
-        Initial.LastTrustedUtc = NowUtc;
-        Initial.LastMonotonicSeconds = NowMono;
-        Initial.AnomalyCount = 0;
-        Initial.Salt = static_cast<uint64>(FPlatformTime::Cycles64()) ^ static_cast<uint64>(NowUtc);
+        InitializeStateCore(Initial, NowUtc, NowMono, CurrentLicenseHash);
         return SaveStateToAllPaths(Initial);
     }
 
     if (ValidStates.Num() == 0)
     {
-        UE_LOG(LogTemp, Error, TEXT("LicenseRuntime: 所有状态副本均不可用，疑似篡改，拒绝授权。"));
-        return false;
+        FLicenseStateCore ResetState{};
+        InitializeStateCore(ResetState, NowUtc, NowMono, CurrentLicenseHash);
+        UE_LOG(LogTemp, Warning, TEXT("LicenseRuntime: 状态文件不可用，已按当前授权文件重建全部状态文件。"));
+        return SaveStateToAllPaths(ResetState);
+    }
+
+    bool bLicenseHashChanged = false;
+    for (const FLicenseStateCore& State : ValidStates)
+    {
+        if (FMemory::Memcmp(State.LicenseHash, CurrentLicenseHash, 32) != 0)
+        {
+            bLicenseHashChanged = true;
+            break;
+        }
+    }
+
+    if (bLicenseHashChanged)
+    {
+        FLicenseStateCore ResetState{};
+        InitializeStateCore(ResetState, NowUtc, NowMono, CurrentLicenseHash);
+        UE_LOG(LogTemp, Log, TEXT("LicenseRuntime: 检测到授权文件变更，已重建全部状态文件。"));
+        return SaveStateToAllPaths(ResetState);
     }
 
     FLicenseStateCore Previous = ValidStates[0];
@@ -344,6 +372,7 @@ static bool VerifyOfflineTimeAndUpdateState()
     {
         Next.LastTrustedUtc = NowUtc;
     }
+    FMemory::Memcpy(Next.LicenseHash, CurrentLicenseHash, 32);
 
     if (bAnomaly)
     {
@@ -424,7 +453,7 @@ static void AES_EncryptFixed(const uint8* In, uint8* Out, int Len)
         AES_ecb_encrypt(In + i, Out + i, &aesKey, AES_ENCRYPT);
 }
 
-static bool VerifyLicensePayloadV2(const uint8* EncryptedPayload, const uint8 Sig[256], FLicenseInfo& OutInfo)
+static bool VerifyLicensePayloadV2(const uint8* EncryptedPayload, const uint8 Sig[256], const uint8 CurrentLicenseHash[32], FLicenseInfo& OutInfo)
 {
     if (!RSA_Verify(EncryptedPayload, sizeof(FLicensePayloadV2), Sig))
     {
@@ -439,7 +468,7 @@ static bool VerifyLicensePayloadV2(const uint8* EncryptedPayload, const uint8 Si
         return false;
     }
 
-    if (!VerifyOfflineTimeAndUpdateState())
+    if (!VerifyOfflineTimeAndUpdateState(CurrentLicenseHash))
     {
         return false;
     }
@@ -483,7 +512,12 @@ bool FLicenseTool::VerifyLicense(const FString& LicPath, FLicenseInfo& OutInfo)
         {
             return false;
         }
-        return VerifyLicensePayloadV2(EncryptedPayload, Sig, OutInfo);
+        uint8 CurrentLicenseHash[32];
+        uint8 RawLicenseBytes[sizeof(FLicensePayloadV2) + sizeof(Sig)];
+        FMemory::Memcpy(RawLicenseBytes, EncryptedPayload, sizeof(EncryptedPayload));
+        FMemory::Memcpy(RawLicenseBytes + sizeof(EncryptedPayload), Sig, sizeof(Sig));
+        SHA256(RawLicenseBytes, sizeof(RawLicenseBytes), CurrentLicenseHash);
+        return VerifyLicensePayloadV2(EncryptedPayload, Sig, CurrentLicenseHash, OutInfo);
     }
 
     delete Handle;
