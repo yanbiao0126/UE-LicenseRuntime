@@ -414,24 +414,6 @@ static bool VerifyOfflineTimeAndUpdateState(const uint8 CurrentLicenseHash[32])
         return SaveStateToAllPaths(ResetState);
     }
 
-    bool bLicenseHashChanged = false;
-    for (const FLicenseStateCore& State : ValidStates)
-    {
-        if (FMemory::Memcmp(State.LicenseHash, CurrentLicenseHash, 32) != 0)
-        {
-            bLicenseHashChanged = true;
-            break;
-        }
-    }
-
-    if (bLicenseHashChanged)
-    {
-        FLicenseStateCore ResetState{};
-        InitializeStateCore(ResetState, NowUtc, NowMono, CurrentLicenseHash);
-        UE_LOG(LogTemp, Log, TEXT("LicenseRuntime: 检测到授权文件变更，已重建全部状态文件。"));
-        return SaveStateToAllPaths(ResetState);
-    }
-
     FLicenseStateCore Previous = ValidStates[0];
     for (int32 Index = 1; Index < ValidStates.Num(); ++Index)
     {
@@ -560,11 +542,6 @@ static bool VerifyLicensePayloadV3(
         return false;
     }
 
-    if (!VerifyOfflineTimeAndUpdateState(CurrentLicenseHash))
-    {
-        return false;
-    }
-
     FString NormalizedPayloadProjectId;
     if (!NormalizeProjectId(UTF8_TO_TCHAR(Payload.ProjectId), NormalizedPayloadProjectId))
     {
@@ -585,6 +562,11 @@ static bool VerifyLicensePayloadV3(
 
     const int64 NowUtc = GetNowUtcSeconds();
     if (Payload.bPermanent == 0 && NowUtc > Payload.ExpireUnixUtc)
+    {
+        return false;
+    }
+
+    if (!VerifyOfflineTimeAndUpdateState(CurrentLicenseHash))
     {
         return false;
     }
