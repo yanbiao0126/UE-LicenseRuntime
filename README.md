@@ -200,7 +200,7 @@ ProjectId="{01234567-89AB-CDEF-0123-456789ABCDEF}"
 
 - `private.key` 仅用于生成 License，不应下发到客户端
 - 当前 AES 密钥与公钥内嵌在代码中，生产环境建议进一步做密钥管理与混淆
-- 纯离线模式下，插件会在多个路径保存可信时间状态副本（`ProjectSavedDir`、`ProjectPersistentDownloadDir`、`UserSettingsDir`）；任一副本缺失/损坏都会计入异常次数
+- 纯离线模式下，插件会在多个路径保存可信时间状态副本（`ProjectSavedDir`、`ProjectPersistentDownloadDir`、`UserSettingsDir`）；任一副本缺失/损坏和墙钟/单调时钟大漂移都会计入异常次数，系统时间明显回拨、License 或状态文件修改时间异常会直接拒绝校验
 - 日期输入建议统一 `YYYY-MM-DD`（生成时会转换为 UTC 时间戳用于过期判定）
 - 项目绑定ID（`ProjectId`）必须在 `DefaultGame.ini` 配置且格式合法（GUID）
 
@@ -255,4 +255,3 @@ ProjectId="{01234567-89AB-CDEF-0123-456789ABCDEF}"
 - 增加许可证吊销列表（黑名单）
 - 接入在线校验或周期心跳校验
 - 将默认 License 路径改为可配置项
-

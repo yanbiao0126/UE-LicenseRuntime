@@ -111,6 +111,9 @@ constexpr int64 ALLOW_BACK_SECONDS = 300;
 // 建议 300~1800，用于识别异常时间跳变。
 constexpr int64 DRIFT_TOLERANCE_SECONDS = 900;
 
+// 文件系统时间戳允许的误差（秒），用于覆盖文件系统精度和时钟同步抖动。
+constexpr int64 FILE_TIME_TOLERANCE_SECONDS = 300;
+
 // 连续检测到时间异常的最大允许次数。
 // 达到该阈值后 VerifyLicense 返回失败。
 constexpr uint32 MAX_ANOMALY_COUNT = 15;
@@ -169,6 +172,24 @@ static TArray<FString> GetStateFilePaths()
 static int64 GetNowUtcSeconds()
 {
     return FDateTime::UtcNow().ToUnixTimestamp();
+}
+
+static bool TryGetFileModifiedUtcSeconds(const FString& FilePath, int64& OutModifiedUtc)
+{
+    IPlatformFile& PlatformFile = FPlatformFileManager::Get().GetPlatformFile();
+    if (!PlatformFile.FileExists(*FilePath))
+    {
+        return false;
+    }
+
+    const FDateTime Timestamp = PlatformFile.GetTimeStamp(*FilePath);
+    if (Timestamp == FDateTime::MinValue())
+    {
+        return false;
+    }
+
+    OutModifiedUtc = Timestamp.ToUnixTimestamp();
+    return true;
 }
 
 static bool NormalizeProjectId(const FString& InProjectId, FString& OutNormalizedProjectId)
@@ -369,7 +390,7 @@ static void InitializeStateCore(FLicenseStateCore& OutCore, int64 NowUtc, double
     OutCore.Salt = static_cast<uint64>(FPlatformTime::Cycles64()) ^ static_cast<uint64>(NowUtc);
 }
 
-static bool VerifyOfflineTimeAndUpdateState(const uint8 CurrentLicenseHash[32])
+static bool VerifyOfflineTimeAndUpdateState(const uint8 CurrentLicenseHash[32], const FString& LicensePath)
 {
     const int64 NowUtc = GetNowUtcSeconds();
     const double NowMono = FPlatformTime::Seconds();
@@ -379,6 +400,19 @@ static bool VerifyOfflineTimeAndUpdateState(const uint8 CurrentLicenseHash[32])
     TArray<FLicenseStateCore> ValidStates;
     int32 ExistingFileCount = 0;
     int32 InvalidFileCount = 0;
+    int32 TimestampAnomalyCount = 0;
+
+    int64 LicenseModifiedUtc = 0;
+    if (TryGetFileModifiedUtcSeconds(LicensePath, LicenseModifiedUtc) &&
+        LicenseModifiedUtc > NowUtc + FILE_TIME_TOLERANCE_SECONDS)
+    {
+        ++TimestampAnomalyCount;
+        UE_LOG(
+            LogTemp,
+            Error,
+            TEXT("LicenseRuntime: License 文件修改时间晚于当前系统时间，疑似系统时间回拨或文件时间篡改: %s"),
+            *LicensePath);
+    }
 
     for (const FString& StatePath : StatePaths)
     {
@@ -391,12 +425,33 @@ static bool VerifyOfflineTimeAndUpdateState(const uint8 CurrentLicenseHash[32])
         FLicenseStateCore State{};
         if (LoadStateFromPath(StatePath, State))
         {
+            int64 StateModifiedUtc = 0;
+            if (TryGetFileModifiedUtcSeconds(StatePath, StateModifiedUtc))
+            {
+                const bool bModifiedInFuture = StateModifiedUtc > NowUtc + FILE_TIME_TOLERANCE_SECONDS;
+                const bool bModifiedBeforeTrusted = StateModifiedUtc + FILE_TIME_TOLERANCE_SECONDS < State.LastTrustedUtc;
+                if (bModifiedInFuture || bModifiedBeforeTrusted)
+                {
+                    ++TimestampAnomalyCount;
+                    UE_LOG(
+                        LogTemp,
+                        Error,
+                        TEXT("LicenseRuntime: 状态文件修改时间异常，疑似系统时间回拨或文件时间篡改: %s"),
+                        *StatePath);
+                }
+            }
             ValidStates.Add(State);
         }
         else
         {
             ++InvalidFileCount;
         }
+    }
+
+    if (TimestampAnomalyCount > 0)
+    {
+        UE_LOG(LogTemp, Error, TEXT("LicenseRuntime: 检测到文件时间戳异常，拒绝授权校验。"));
+        return false;
     }
 
     if (ExistingFileCount == 0)
@@ -408,10 +463,8 @@ static bool VerifyOfflineTimeAndUpdateState(const uint8 CurrentLicenseHash[32])
 
     if (ValidStates.Num() == 0)
     {
-        FLicenseStateCore ResetState{};
-        InitializeStateCore(ResetState, NowUtc, NowMono, CurrentLicenseHash);
-        UE_LOG(LogTemp, Warning, TEXT("LicenseRuntime: 状态文件不可用，已按当前授权文件重建全部状态文件。"));
-        return SaveStateToAllPaths(ResetState);
+        UE_LOG(LogTemp, Error, TEXT("LicenseRuntime: 已存在状态文件但全部不可用，拒绝自动重建。"));
+        return false;
     }
 
     FLicenseStateCore Previous = ValidStates[0];
@@ -433,7 +486,9 @@ static bool VerifyOfflineTimeAndUpdateState(const uint8 CurrentLicenseHash[32])
     const bool bDriftAnomaly = Drift > DRIFT_TOLERANCE_SECONDS;
     const bool bMissingReplica = ExistingFileCount < StatePaths.Num();
     const bool bCorruptReplica = InvalidFileCount > 0;
-    const bool bAnomaly = bRollback || bDriftAnomaly || bMissingReplica || bCorruptReplica;
+    const bool bTimestampAnomaly = TimestampAnomalyCount > 0;
+    const bool bHardTimeAnomaly = bRollback || bTimestampAnomaly;
+    const bool bAnomaly = bHardTimeAnomaly || bMissingReplica || bCorruptReplica || bTimestampAnomaly;
 
     FLicenseStateCore Next = Previous;
     Next.LastMonotonicSeconds = NowMono;
@@ -448,15 +503,33 @@ static bool VerifyOfflineTimeAndUpdateState(const uint8 CurrentLicenseHash[32])
         Next.AnomalyCount = Previous.AnomalyCount + 1;
         SaveStateToAllPaths(Next);
 
+        if (bHardTimeAnomaly)
+        {
+            UE_LOG(
+                LogTemp,
+                Error,
+                TEXT("LicenseRuntime: 检测到严重授权时间异常，DeltaUtc=%lld, DeltaMono=%lld, Drift=%lld, MissingReplica=%d, CorruptReplica=%d, TimestampAnomaly=%d, Count=%u"),
+                DeltaUtc,
+                DeltaMono,
+                Drift,
+                bMissingReplica ? 1 : 0,
+                bCorruptReplica ? 1 : 0,
+                bTimestampAnomaly ? 1 : 0,
+                Next.AnomalyCount
+            );
+            return false;
+        }
+
         UE_LOG(
             LogTemp,
             Warning,
-            TEXT("LicenseRuntime: 检测到授权状态异常，DeltaUtc=%lld, DeltaMono=%lld, Drift=%lld, MissingReplica=%d, CorruptReplica=%d, Count=%u"),
+            TEXT("LicenseRuntime: 检测到授权状态异常，DeltaUtc=%lld, DeltaMono=%lld, Drift=%lld, MissingReplica=%d, CorruptReplica=%d, TimestampAnomaly=%d, Count=%u"),
             DeltaUtc,
             DeltaMono,
             Drift,
             bMissingReplica ? 1 : 0,
             bCorruptReplica ? 1 : 0,
+            bTimestampAnomaly ? 1 : 0,
             Next.AnomalyCount
         );
         return Next.AnomalyCount < MAX_ANOMALY_COUNT;
@@ -526,6 +599,7 @@ static bool VerifyLicensePayloadV3(
     const uint8* EncryptedPayload,
     const uint8 Sig[256],
     const uint8 CurrentLicenseHash[32],
+    const FString& LicensePath,
     const FString& ConfiguredProjectId,
     FLicenseInfo& OutInfo)
 {
@@ -566,7 +640,7 @@ static bool VerifyLicensePayloadV3(
         return false;
     }
 
-    if (!VerifyOfflineTimeAndUpdateState(CurrentLicenseHash))
+    if (!VerifyOfflineTimeAndUpdateState(CurrentLicenseHash, LicensePath))
     {
         return false;
     }
@@ -615,7 +689,7 @@ bool FLicenseTool::VerifyLicense(const FString& LicPath, FLicenseInfo& OutInfo)
         FMemory::Memcpy(RawLicenseBytes, EncryptedPayload, sizeof(EncryptedPayload));
         FMemory::Memcpy(RawLicenseBytes + sizeof(EncryptedPayload), Sig, sizeof(Sig));
         SHA256(RawLicenseBytes, sizeof(RawLicenseBytes), CurrentLicenseHash);
-        return VerifyLicensePayloadV3(EncryptedPayload, Sig, CurrentLicenseHash, ConfiguredProjectId, OutInfo);
+        return VerifyLicensePayloadV3(EncryptedPayload, Sig, CurrentLicenseHash, LicPath, ConfiguredProjectId, OutInfo);
     }
 
     if (FileSize == static_cast<int64>(sizeof(FLicensePayloadV2Legacy) + sizeof(Sig)))
